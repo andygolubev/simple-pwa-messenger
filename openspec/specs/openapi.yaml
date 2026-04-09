@@ -1,0 +1,614 @@
+openapi: 3.1.0
+info:
+  title: Encrypted Messenger API
+  version: 1.0.0
+  description: |
+    Privacy-first encrypted messenger API running on GCP Cloud Functions.
+    All messages are end-to-end encrypted using the Signal Protocol (X3DH + Double Ratchet)
+    implemented in Rust/WASM on the client. The server never sees plaintext.
+  contact:
+    email: admin@yourdomain.com
+
+servers:
+  - url: https://{region}-{project}.cloudfunctions.net
+    description: GCP Cloud Functions (2nd gen)
+    variables:
+      region:
+        default: europe-west1
+      project:
+        default: your-project-id
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Auth
+    description: Authentication via Google Identity Platform
+  - name: Keys
+    description: Signal Protocol key management (identity keys, prekeys)
+  - name: Chat
+    description: Encrypted message sending, history, and polling
+  - name: Push
+    description: Web Push notification subscription management
+
+paths:
+  /auth/google:
+    post:
+      operationId: authenticateGoogle
+      tags: [Auth]
+      summary: Authenticate with Google ID token
+      description: |
+        Verifies a Google ID token via Identity Platform, upserts the user
+        document in Firestore, and returns an app JWT for subsequent requests.
+        On first login (`isNewUser: true`), the client should generate identity
+        keys and prekeys via WASM and upload them.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idToken]
+              properties:
+                idToken:
+                  type: string
+                  description: Google ID token obtained from Identity Platform signInWithPopup()
+      responses:
+        "200":
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jwt, uid, isNewUser]
+                properties:
+                  jwt:
+                    type: string
+                    description: App JWT (HMAC-signed, 1h expiry) for authenticating subsequent API calls
+                  uid:
+                    type: string
+                    description: User's unique identifier
+                  isNewUser:
+                    type: boolean
+                    description: True if this is the user's first login — client should generate and upload keys
+        "401":
+          description: Invalid or expired Google ID token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /keys/identity:
+    post:
+      operationId: publishIdentityKeys
+      tags: [Keys]
+      summary: Publish identity public keys
+      description: |
+        Publishes the user's long-term identity public key (X25519) and signing
+        public key (Ed25519) to the server. Called once after first login when
+        the client generates the identity keypair via WASM `generate_identity()`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identityPublicKey, signingPublicKey]
+              properties:
+                identityPublicKey:
+                  type: string
+                  format: base64
+                  description: Base64-encoded X25519 identity public key
+                signingPublicKey:
+                  type: string
+                  format: base64
+                  description: Base64-encoded Ed25519 signing public key
+      responses:
+        "200":
+          description: Identity keys stored successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /keys/prekeys:
+    post:
+      operationId: uploadPrekeys
+      tags: [Keys]
+      summary: Upload signed prekey and one-time prekeys
+      description: |
+        Uploads a signed prekey and/or a batch of one-time prekeys. Used on
+        first login (upload both), for periodic signed prekey rotation (monthly),
+        and for one-time prekey replenishment when the server count drops below
+        the low threshold.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                signedPreKey:
+                  $ref: "#/components/schemas/SignedPreKeyUpload"
+                oneTimePreKeys:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/OneTimePreKeyUpload"
+                  description: Batch of one-time prekeys (public parts only). Typically 20 at a time.
+              anyOf:
+                - required: [signedPreKey]
+                - required: [oneTimePreKeys]
+      responses:
+        "200":
+          description: Prekeys stored successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  oneTimePreKeyCount:
+                    type: integer
+                    description: Total one-time prekeys now available on the server for this user
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /keys/bundle:
+    get:
+      operationId: getPreKeyBundle
+      tags: [Keys]
+      summary: Fetch a user's prekey bundle
+      description: |
+        Retrieves the prekey bundle needed to establish an X3DH session with a
+        user. The server atomically pops one one-time prekey (if available).
+        If `countOnly=true`, returns only the one-time prekey count (used for
+        replenishment checks on the authenticated user's own bundle).
+      parameters:
+        - name: uid
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Target user's UID whose prekey bundle to fetch
+        - name: countOnly
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: If true, return only `oneTimePreKeyCount` without consuming a prekey
+      responses:
+        "200":
+          description: Prekey bundle retrieved
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/PreKeyBundle"
+                  - $ref: "#/components/schemas/PreKeyCount"
+        "404":
+          description: User not found or no prekey bundle published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /chat/send:
+    post:
+      operationId: sendMessage
+      tags: [Chat]
+      summary: Send an encrypted message
+      description: |
+        Stores an encrypted message (Double Ratchet output) in Firestore and
+        triggers a Web Push notification to the recipient. The server never sees
+        plaintext — only ciphertext and ratchet headers.
+
+        For the first message in a new session, set `type: "x3dh_initial"` and
+        include `ephemeralPublic` and `usedOneTimePreKeyId`. The server will
+        atomically remove the used one-time prekey from the recipient's bundle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "200":
+          description: Message stored and push notification sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messageId, serverTimestamp]
+                properties:
+                  messageId:
+                    type: string
+                    description: Firestore document ID of the stored message
+                  serverTimestamp:
+                    type: string
+                    format: date-time
+                    description: Server-assigned timestamp for ordering
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Room not found or recipient does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /chat/history:
+    get:
+      operationId: getChatHistory
+      tags: [Chat]
+      summary: Get encrypted message history
+      description: |
+        Returns paginated encrypted messages for a room. Messages are ordered
+        by `createdAt` ascending. The client decrypts each message locally
+        using the Double Ratchet session state.
+      parameters:
+        - name: roomId
+          in: query
+          required: true
+          schema:
+            type: string
+          description: |
+            Room ID. For 1:1 chats, derived as `SHA-256(sort([uid1, uid2]).join(":"))`
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+          description: Number of messages to return
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Cursor (message ID or server timestamp) for pagination — returns messages after this point
+      responses:
+        "200":
+          description: Encrypted messages returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EncryptedMessage"
+                  nextCursor:
+                    type: string
+                    nullable: true
+                    description: Cursor for the next page, or null if no more messages
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: User is not a participant of this room
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /chat/poll:
+    get:
+      operationId: pollNewMessages
+      tags: [Chat]
+      summary: Poll for rooms with new messages
+      description: |
+        Returns rooms that have received new messages since the given timestamp.
+        Used for lightweight polling to detect new activity without fetching
+        full message history.
+      parameters:
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+          description: ISO 8601 timestamp — returns rooms with messages after this time
+      responses:
+        "200":
+          description: Rooms with new activity
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rooms]
+                properties:
+                  rooms:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RoomSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /push/subscribe:
+    post:
+      operationId: subscribePush
+      tags: [Push]
+      summary: Register a Web Push subscription
+      description: |
+        Stores a Web Push subscription for the authenticated user's device.
+        The subscription is obtained from the browser's Push API using VAPID.
+        Multiple devices can be subscribed simultaneously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushSubscriptionRequest"
+      responses:
+        "200":
+          description: Subscription stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deviceId:
+                    type: string
+                    description: Server-assigned device identifier for this subscription
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    delete:
+      operationId: unsubscribePush
+      tags: [Push]
+      summary: Remove a Web Push subscription
+      description: |
+        Removes a Web Push subscription for the authenticated user's device.
+        Called on logout or when the user disables notifications.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint]
+              properties:
+                endpoint:
+                  type: string
+                  format: uri
+                  description: The Web Push endpoint URL to unsubscribe
+      responses:
+        "200":
+          description: Subscription removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Subscription not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: App JWT returned by POST /auth/google. HMAC-signed, 1h expiry.
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or expired JWT
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+
+    SignedPreKeyUpload:
+      type: object
+      required: [id, publicKey, signature]
+      properties:
+        id:
+          type: integer
+          description: Prekey identifier
+        publicKey:
+          type: string
+          format: base64
+          description: Base64-encoded X25519 public key
+        signature:
+          type: string
+          format: base64
+          description: Base64-encoded Ed25519 signature over the public key, signed with the identity signing key
+
+    OneTimePreKeyUpload:
+      type: object
+      required: [id, publicKey]
+      properties:
+        id:
+          type: integer
+          description: Prekey identifier
+        publicKey:
+          type: string
+          format: base64
+          description: Base64-encoded X25519 public key
+
+    PreKeyBundle:
+      type: object
+      required: [identityPublicKey, signingPublicKey, signedPreKey]
+      properties:
+        identityPublicKey:
+          type: string
+          format: base64
+          description: Base64-encoded X25519 identity public key
+        signingPublicKey:
+          type: string
+          format: base64
+          description: Base64-encoded Ed25519 signing public key
+        signedPreKey:
+          type: object
+          required: [id, publicKey, signature]
+          properties:
+            id:
+              type: integer
+            publicKey:
+              type: string
+              format: base64
+            signature:
+              type: string
+              format: base64
+              description: Ed25519 signature over publicKey, verifiable with signingPublicKey
+        oneTimePreKey:
+          type: object
+          nullable: true
+          description: Atomically popped one-time prekey, or null if none are available
+          properties:
+            id:
+              type: integer
+            publicKey:
+              type: string
+              format: base64
+
+    PreKeyCount:
+      type: object
+      required: [oneTimePreKeyCount]
+      properties:
+        oneTimePreKeyCount:
+          type: integer
+          description: Number of one-time prekeys remaining on the server
+
+    SendMessageRequest:
+      type: object
+      required: [roomId, recipientUid, type, header, ciphertext]
+      properties:
+        roomId:
+          type: string
+          description: "Room ID. For 1:1 chats: SHA-256(sort([uid1, uid2]).join(\":\"))"
+        recipientUid:
+          type: string
+          description: Recipient's user ID (used for push notification routing)
+        type:
+          type: string
+          enum: [x3dh_initial, ratchet]
+          description: |
+            `x3dh_initial` — first message in a new session (includes ephemeral key exchange data).
+            `ratchet` — subsequent messages using established Double Ratchet session.
+        header:
+          type: string
+          format: base64
+          description: Base64-encoded Double Ratchet header (ratchet public key, previous chain length, message number)
+        ciphertext:
+          type: string
+          format: base64
+          description: Base64-encoded AES-256-GCM encrypted message payload
+        ephemeralPublic:
+          type: string
+          format: base64
+          nullable: true
+          description: Base64-encoded X25519 ephemeral public key. Required when `type` is `x3dh_initial`.
+        usedOneTimePreKeyId:
+          type: integer
+          nullable: true
+          description: ID of the one-time prekey consumed during X3DH. Required when `type` is `x3dh_initial`.
+
+    EncryptedMessage:
+      type: object
+      required: [messageId, senderUid, type, header, ciphertext, createdAt, serverTimestamp]
+      properties:
+        messageId:
+          type: string
+          description: Unique message identifier
+        senderUid:
+          type: string
+          description: UID of the message sender
+        type:
+          type: string
+          enum: [x3dh_initial, ratchet]
+        header:
+          type: string
+          format: base64
+          description: Base64-encoded Double Ratchet header
+        ciphertext:
+          type: string
+          format: base64
+          description: Base64-encoded AES-256-GCM encrypted payload
+        ephemeralPublic:
+          type: string
+          format: base64
+          nullable: true
+          description: Present only when `type` is `x3dh_initial`
+        usedOneTimePreKeyId:
+          type: integer
+          nullable: true
+          description: Present only when `type` is `x3dh_initial`
+        createdAt:
+          type: string
+          format: date-time
+        serverTimestamp:
+          type: string
+          format: date-time
+          description: Server-assigned timestamp used for ordering
+
+    RoomSummary:
+      type: object
+      required: [roomId, participants, lastMessageAt]
+      properties:
+        roomId:
+          type: string
+        participants:
+          type: array
+          items:
+            type: string
+          description: Sorted array of participant UIDs
+        lastMessageAt:
+          type: string
+          format: date-time
+        unreadCount:
+          type: integer
+          description: Number of new messages since the `since` parameter
+
+    PushSubscriptionRequest:
+      type: object
+      required: [endpoint, keys]
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          description: Web Push endpoint URL from PushSubscription
+        keys:
+          type: object
+          required: [p256dh, auth]
+          properties:
+            p256dh:
+              type: string
+              description: Client's P-256 public key (base64url)
+            auth:
+              type: string
+              description: Client's auth secret (base64url)
+        userAgent:
+          type: string
+          description: Browser user agent string (for debugging)

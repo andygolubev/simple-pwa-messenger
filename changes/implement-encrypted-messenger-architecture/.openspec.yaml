@@ -1,0 +1,19 @@
+schema: spec-driven
+change:
+  name: implement-encrypted-messenger-architecture
+  title: Implement encrypted messenger architecture on GCP
+  status: proposed
+apply:
+  requires:
+    - tasks
+artifacts:
+  - id: proposal
+    path: proposal.md
+  - id: design
+    path: design.md
+    dependsOn:
+      - proposal
+  - id: tasks
+    path: tasks.md
+    dependsOn:
+      - design
