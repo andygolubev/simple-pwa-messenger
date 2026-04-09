@@ -1,3 +1,7 @@
+## Purpose
+
+Define the encrypted messenger platform: Google-authenticated clients, client-side Rust/WASM Signal-style cryptography (X3DH and Double Ratchet), Cloud Functions and Firestore for ciphertext and metadata only, Web Push with VAPID and non-content payloads, and GCP infrastructure provisioned as Terraform modules.
+
 ## Requirements
 
 ### Requirement: Google sign-in bootstraps application identity
