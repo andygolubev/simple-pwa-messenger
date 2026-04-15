@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # ─── Terraform ───────────────────────────────────────────────────────────────
+
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+      - name: Format check
+        run: pipelines/scripts/tf-validate.sh fmt
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    needs: terraform-fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+      - name: Validate
+        run: pipelines/scripts/tf-validate.sh validate
+
+  # ─── Rust / WASM ─────────────────────────────────────────────────────────────
+
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/messenger-crypto
+      - name: Run tests
+        run: pipelines/scripts/rust-validate.sh test
+      - name: Check WASM target
+        run: pipelines/scripts/rust-validate.sh check-wasm32
+
+  # ─── Cloud Functions ─────────────────────────────────────────────────────────
+
+  functions:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: functions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: functions/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+
+  # ─── PWA ─────────────────────────────────────────────────────────────────────
+
+  pwa:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/pwa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/pwa/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test

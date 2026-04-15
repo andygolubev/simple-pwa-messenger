@@ -1,0 +1,80 @@
+# validate.yml — Reusable CI validation pipeline
+# Runs: Terraform fmt/validate, Rust tests, WASM build check, Functions lint+test, PWA lint+test
+#
+# Designed to be referenced from runner-specific entrypoints (.github/workflows, GitLab CI, etc.)
+
+stages:
+  - terraform-validate
+  - rust-validate
+  - functions-validate
+  - pwa-validate
+
+# ─── Terraform ─────────────────────────────────────────────────────────────────
+
+terraform-fmt-check:
+  stage: terraform-validate
+  script:
+    - pipelines/scripts/tf-validate.sh fmt
+  artifacts:
+    when: on_failure
+    reports:
+      junit: tf-fmt.xml
+
+terraform-validate:
+  stage: terraform-validate
+  script:
+    - pipelines/scripts/tf-validate.sh validate
+  needs:
+    - terraform-fmt-check
+
+# ─── Rust / WASM ───────────────────────────────────────────────────────────────
+
+rust-test:
+  stage: rust-validate
+  script:
+    - pipelines/scripts/rust-validate.sh test
+
+rust-check-wasm32:
+  stage: rust-validate
+  script:
+    - pipelines/scripts/rust-validate.sh check-wasm32
+  needs:
+    - rust-test
+
+# ─── Cloud Functions ──────────────────────────────────────────────────────────
+
+functions-typecheck:
+  stage: functions-validate
+  script:
+    - pipelines/scripts/functions-validate.sh typecheck
+
+functions-lint:
+  stage: functions-validate
+  script:
+    - pipelines/scripts/functions-validate.sh lint
+
+functions-test:
+  stage: functions-validate
+  script:
+    - pipelines/scripts/functions-validate.sh test
+  needs:
+    - functions-typecheck
+
+# ─── PWA ──────────────────────────────────────────────────────────────────────
+
+pwa-typecheck:
+  stage: pwa-validate
+  script:
+    - pipelines/scripts/pwa-validate.sh typecheck
+
+pwa-lint:
+  stage: pwa-validate
+  script:
+    - pipelines/scripts/pwa-validate.sh lint
+
+pwa-test:
+  stage: pwa-validate
+  script:
+    - pipelines/scripts/pwa-validate.sh test
+  needs:
+    - pwa-typecheck

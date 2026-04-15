@@ -1,0 +1,33 @@
+# build.yml — Reusable CI build pipeline
+# Runs after validate; produces deployable artifacts for each environment.
+
+stages:
+  - wasm-build
+  - pwa-build
+  - functions-build
+
+wasm-build:
+  stage: wasm-build
+  script:
+    - pipelines/scripts/rust-validate.sh build-wasm
+  artifacts:
+    paths:
+      - apps/pwa/pkg/
+
+pwa-build:
+  stage: pwa-build
+  script:
+    - pipelines/scripts/pwa-validate.sh build
+  needs:
+    - wasm-build
+  artifacts:
+    paths:
+      - apps/pwa/dist/
+
+functions-build:
+  stage: functions-build
+  script:
+    - pipelines/scripts/functions-validate.sh build
+  artifacts:
+    paths:
+      - functions/dist/

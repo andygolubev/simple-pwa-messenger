@@ -29,3 +29,32 @@ fn x3dh_initiator_and_responder_derive_same_root_key() {
 
     assert_eq!(initiated.root_key, responded.root_key);
 }
+
+#[test]
+fn x3dh_without_one_time_prekey_derives_same_root_key() {
+    let alice = generate_identity_native().expect("alice");
+    let bob = generate_identity_native().expect("bob");
+    let bob_signed = bob.generate_signed_prekey(2).expect("spk");
+
+    let initiated = x3dh_initiate_native(
+        &alice.identity.private_key,
+        &bob.identity.public_key,
+        &bob_signed.public_key,
+        &bob_signed.signature,
+        Some(&bob.signing.public_key),
+        None,
+        None,
+    )
+    .expect("initiate");
+
+    let responded = x3dh_respond_native(
+        &bob.identity.private_key,
+        &bob_signed.private_key,
+        None,
+        &alice.identity.public_key,
+        &initiated.ephemeral_public,
+    )
+    .expect("respond");
+
+    assert_eq!(initiated.root_key, responded.root_key);
+}
